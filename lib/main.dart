@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -50,15 +52,18 @@ Future<void> main() async {
   final supabaseUrl = config['SUPABASE_URL'] as String? ?? '';
   final publishableKey = config['SUPABASE_PUBLISHABLE_KEY'] as String? ?? '';
   final isConfigured = supabaseUrl.isNotEmpty && publishableKey.isNotEmpty;
+  final isRecoveryCallback =
+      Uri.base.queryParameters['auth_flow'] == 'recovery' ||
+      Uri.base.fragment.contains('type=recovery');
   String? authCallbackError;
 
   if (isConfigured) {
     await Supabase.initialize(
       url: supabaseUrl,
       publishableKey: publishableKey,
-      // Exchange auth callback codes explicitly before rendering the recovery
-      // screen, so it never appears before its session is ready.
-      authOptions: const FlutterAuthClientOptions(detectSessionInUri: false),
+      // The web callback is exchanged explicitly below; native callback links
+      // are handled by Supabase's deep-link listener.
+      authOptions: FlutterAuthClientOptions(detectSessionInUri: !kIsWeb),
     );
 
     final callbackUri = Uri.base;
@@ -77,7 +82,11 @@ Future<void> main() async {
   }
 
   runApp(
-    ShopApp(isConfigured: isConfigured, authCallbackError: authCallbackError),
+    ShopApp(
+      isConfigured: isConfigured,
+      authCallbackError: authCallbackError,
+      isRecoveryCallback: isRecoveryCallback,
+    ),
   );
 }
 
@@ -86,10 +95,12 @@ class ShopApp extends StatelessWidget {
     super.key,
     required this.isConfigured,
     this.authCallbackError,
+    this.isRecoveryCallback = false,
   });
 
   final bool isConfigured;
   final String? authCallbackError;
+  final bool isRecoveryCallback;
 
   @override
   Widget build(BuildContext context) {
@@ -115,7 +126,10 @@ class ShopApp extends StatelessWidget {
         ),
       ),
       home: isConfigured
-          ? AuthFlowGate(callbackError: authCallbackError)
+          ? AuthFlowGate(
+              callbackError: authCallbackError,
+              isRecoveryCallback: isRecoveryCallback,
+            )
           : const MissingKeyPage(),
     );
   }
@@ -124,9 +138,14 @@ class ShopApp extends StatelessWidget {
 /// Routes password recovery links to a dedicated password form. Supabase emits
 /// [AuthChangeEvent.passwordRecovery] after it processes the recovery URL.
 class AuthFlowGate extends StatefulWidget {
-  const AuthFlowGate({super.key, this.callbackError});
+  const AuthFlowGate({
+    super.key,
+    this.callbackError,
+    required this.isRecoveryCallback,
+  });
 
   final String? callbackError;
+  final bool isRecoveryCallback;
 
   @override
   State<AuthFlowGate> createState() => _AuthFlowGateState();
@@ -134,11 +153,10 @@ class AuthFlowGate extends StatefulWidget {
 
 class _AuthFlowGateState extends State<AuthFlowGate> {
   StreamSubscription<AuthState>? _authSubscription;
-  // PKCE recovery links return as `/?code=...`; implicit-flow links return
-  // with `#type=recovery`. Supabase exchanges a PKCE code during initialization,
-  // so detect the callback URL here as well as listening for the auth event.
+  // Recovery redirects carry an explicit marker so Google OAuth PKCE callbacks
+  // are not mistaken for password-recovery sessions.
   bool _isRecoveringPassword =
-      Uri.base.queryParameters.containsKey('code') ||
+      Uri.base.queryParameters['auth_flow'] == 'recovery' ||
       Uri.base.fragment.contains('type=recovery');
 
   @override
@@ -163,7 +181,10 @@ class _AuthFlowGateState extends State<AuthFlowGate> {
   @override
   Widget build(BuildContext context) {
     if (widget.callbackError != null) {
-      return RecoveryLinkErrorPage(details: widget.callbackError!);
+      return AuthCallbackErrorPage(
+        details: widget.callbackError!,
+        isRecovery: widget.isRecoveryCallback,
+      );
     }
     if (_isRecoveringPassword) {
       return PasswordRecoveryPage(
@@ -174,10 +195,15 @@ class _AuthFlowGateState extends State<AuthFlowGate> {
   }
 }
 
-class RecoveryLinkErrorPage extends StatelessWidget {
-  const RecoveryLinkErrorPage({super.key, required this.details});
+class AuthCallbackErrorPage extends StatelessWidget {
+  const AuthCallbackErrorPage({
+    super.key,
+    required this.details,
+    required this.isRecovery,
+  });
 
   final String details;
+  final bool isRecovery;
 
   @override
   Widget build(BuildContext context) {
@@ -194,14 +220,20 @@ class RecoveryLinkErrorPage extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'This reset link could not be verified',
+                    isRecovery
+                        ? 'This reset link could not be verified'
+                        : 'Sign-in could not be completed',
                     style: Theme.of(context).textTheme.headlineSmall,
                   ),
                   const SizedBox(height: 12),
-                  const Text(
-                    'Request a fresh link from this app and open it in the same '
-                    'Chrome profile where you requested it. Recovery links are '
-                    'one-use and expire quickly.',
+                  Text(
+                    isRecovery
+                        ? 'Request a fresh link from this app and open it in '
+                              'the same browser profile where you requested '
+                              'it. Recovery links are one-use and expire quickly.'
+                        : 'Return to the shop and try signing in again. Check '
+                              'that Google is enabled in Supabase and the '
+                              'redirect URLs are configured.',
                   ),
                   const SizedBox(height: 12),
                   Text(details, style: const TextStyle(color: _tomato)),
@@ -529,6 +561,11 @@ class _ProductShopPageState extends State<ProductShopPage> {
   Timer? _searchDebounce;
   StreamSubscription<dynamic>? _authSubscription;
 
+  bool get _supportsGoogleSignIn =>
+      kIsWeb ||
+      defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
+
   @override
   void initState() {
     super.initState();
@@ -641,12 +678,18 @@ class _ProductShopPageState extends State<ProductShopPage> {
       ),
       actions: [
         IconButton(
-          tooltip: _controller.isAdmin ? 'Sign out of admin' : 'Admin sign in',
-          onPressed: _handleAdminAccess,
+          tooltip: Supabase.instance.client.auth.currentUser == null
+              ? 'Sign in'
+              : _controller.isAdmin
+              ? 'Sign out of admin account'
+              : 'Sign out of account',
+          onPressed: _handleAccountAccess,
           icon: Icon(
-            _controller.isAdmin
+            Supabase.instance.client.auth.currentUser == null
+                ? Icons.account_circle_outlined
+                : _controller.isAdmin
                 ? Icons.admin_panel_settings_rounded
-                : Icons.admin_panel_settings_outlined,
+                : Icons.account_circle_rounded,
             color: _forest,
           ),
         ),
@@ -1055,9 +1098,9 @@ class _ProductShopPageState extends State<ProductShopPage> {
     );
   }
 
-  Future<void> _handleAdminAccess() async {
+  Future<void> _handleAccountAccess() async {
     final auth = Supabase.instance.client.auth;
-    if (_controller.isAdmin) {
+    if (auth.currentUser != null) {
       await auth.signOut();
       return;
     }
@@ -1067,7 +1110,7 @@ class _ProductShopPageState extends State<ProductShopPage> {
     final signInAction = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Admin sign in'),
+        title: const Text('Sign in to E-commerce'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1082,6 +1125,28 @@ class _ProductShopPageState extends State<ProductShopPage> {
               decoration: const InputDecoration(labelText: 'Password'),
               onSubmitted: (_) => Navigator.pop(dialogContext, 'sign-in'),
             ),
+            if (_supportsGoogleSignIn) ...[
+              const SizedBox(height: 16),
+              const Row(
+                children: [
+                  Expanded(child: Divider()),
+                  Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 12),
+                    child: Text('OR'),
+                  ),
+                  Expanded(child: Divider()),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => Navigator.pop(dialogContext, 'google'),
+                  icon: const Icon(Icons.g_mobiledata_rounded, size: 26),
+                  label: const Text('Continue with Google'),
+                ),
+              ),
+            ],
           ],
         ),
         actions: [
@@ -1101,7 +1166,9 @@ class _ProductShopPageState extends State<ProductShopPage> {
       ),
     );
 
-    if (signInAction == 'recover') {
+    if (signInAction == 'google') {
+      await _signInWithGoogle();
+    } else if (signInAction == 'recover') {
       await _sendPasswordRecovery(emailController.text.trim());
     } else if (signInAction == 'sign-in') {
       try {
@@ -1109,21 +1176,51 @@ class _ProductShopPageState extends State<ProductShopPage> {
           email: emailController.text.trim(),
           password: passwordController.text,
         );
-        if (!_controller.isAdmin) {
-          await auth.signOut();
-          throw Exception('This account does not have the admin role.');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                _controller.isAdmin
+                    ? 'Signed in with admin access.'
+                    : 'Signed in successfully.',
+              ),
+            ),
+          );
         }
       } catch (error) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Admin sign in failed: $error')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Sign-in failed: $error')));
         }
       }
     }
 
     emailController.dispose();
     passwordController.dispose();
+  }
+
+  Future<void> _signInWithGoogle() async {
+    final redirectTo = kIsWeb
+        ? Uri.base.origin
+        : 'io.supabase.fluttershop://login-callback';
+    try {
+      final launched = await Supabase.instance.client.auth.signInWithOAuth(
+        OAuthProvider.google,
+        redirectTo: redirectTo,
+      );
+      if (!launched && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open Google sign-in.')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Google sign-in failed: $error')),
+        );
+      }
+    }
   }
 
   Future<void> _sendPasswordRecovery(String suggestedEmail) async {
@@ -1158,7 +1255,9 @@ class _ProductShopPageState extends State<ProductShopPage> {
     try {
       await Supabase.instance.client.auth.resetPasswordForEmail(
         email,
-        redirectTo: 'http://localhost:3000',
+        redirectTo: kIsWeb
+            ? '${Uri.base.origin}/?auth_flow=recovery'
+            : 'io.supabase.fluttershop://login-callback?auth_flow=recovery',
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
