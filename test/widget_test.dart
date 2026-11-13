@@ -8,6 +8,6 @@ void main() {
     await tester.pumpWidget(const ShopApp(isConfigured: false));
 
     expect(find.textContaining('supabase_config.json'), findsOneWidget);
-    expect(find.text('flutter run'), findsOneWidget);
+    expect(find.textContaining('then run flutter run'), findsOneWidget);
   });
 }
